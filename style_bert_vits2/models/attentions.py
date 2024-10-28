@@ -85,6 +85,7 @@ class Encoder(nn.Module):
                     hidden_channels,
                     hidden_channels,
                     n_heads,
+                    i,
                     p_dropout=p_dropout,
                     window_size=window_size,
                 )
@@ -222,6 +223,7 @@ class MultiHeadAttention(nn.Module):
         channels: int,
         out_channels: int,
         n_heads: int,
+        layer_idx: int,
         p_dropout: float = 0.0,
         window_size: Optional[int] = None,
         heads_share: bool = True,
@@ -249,6 +251,12 @@ class MultiHeadAttention(nn.Module):
         self.conv_v = nn.Conv1d(channels, channels, 1)
         self.conv_o = nn.Conv1d(channels, out_channels, 1)
         self.drop = nn.Dropout(p_dropout)
+
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (layer_idx))
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.k_channels, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.k_channels, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.k_channels, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.k_channels, dtype=torch.float32).normal_(mean=0, std=0.1))
 
         if window_size is not None:
             n_heads_rel = 1 if heads_share else n_heads
@@ -297,35 +305,61 @@ class MultiHeadAttention(nn.Module):
         key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
         value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
 
-        scores = torch.matmul(query / math.sqrt(self.k_channels), key.transpose(-2, -1))
+        query_1, query_2 = torch.chunk(query, 2, dim=-1)
+        key_1, key_2 = torch.chunk(key, 2, dim=-1)
+
+        scores_1 = torch.matmul(query_1 / math.sqrt(self.k_channels), key.transpose(-2, -1))
+        scores_2 = torch.matmul(query_2 / math.sqrt(self.k_channels), key.transpose(-2, -1))
         if self.window_size is not None:
             assert (
                 t_s == t_t
             ), "Relative attention is only available for self-attention."
             key_relative_embeddings = self._get_relative_embeddings(self.emb_rel_k, t_s)
-            rel_logits = self._matmul_with_relative_keys(
-                query / math.sqrt(self.k_channels), key_relative_embeddings
+            rel_logits_1 = self._matmul_with_relative_keys(
+                query_1 / math.sqrt(self.k_channels), key_relative_embeddings
             )
-            scores_local = self._relative_position_to_absolute_position(rel_logits)
-            scores = scores + scores_local
+            rel_logits_2 = self._matmul_with_relative_keys(
+                query_2 / math.sqrt(self.k_channels), key_relative_embeddings
+            )
+            scores_local_1 = self._relative_position_to_absolute_position(rel_logits_1)
+            scores_local_2 = self._relative_position_to_absolute_position(rel_logits_2)
+            scores_1 += scores_local_1
+            scores_2 += scores_local_2
         if self.proximal_bias:
             assert t_s == t_t, "Proximal bias is only available for self-attention."
-            scores = scores + self._attention_bias_proximal(t_s).to(
-                device=scores.device, dtype=scores.dtype
+            scores_1 = scores_1 + self._attention_bias_proximal(t_s).to(
+                device=scores_1.device, dtype=scores_1.dtype
+            )
+            scores_2 = scores_2 + self._attention_bias_proximal(t_s).to(
+                device=scores_2.device, dtype=scores_2.dtype
             )
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e4)
+            scores_1 = scores_1.masked_fill(mask == 0, -1e4)
+            scores_2 = scores_2.masked_fill(mask == 0, -1e4)
             if self.block_length is not None:
                 assert (
                     t_s == t_t
                 ), "Local attention is only available for self-attention."
-                block_mask = (
-                    torch.ones_like(scores)
+                block_mask_1 = (
+                    torch.ones_like(scores_1)
                     .triu(-self.block_length)
                     .tril(self.block_length)
                 )
-                scores = scores.masked_fill(block_mask == 0, -1e4)
-        p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
+                block_mask_2 = (
+                    torch.ones_like(scores_2)
+                    .triu(-self.block_length)
+                    .tril(self.block_length)
+                )
+                scores_1 = scores_1.masked_fill(block_mask_1 == 0, -1e4)
+                scores_2 = scores_2.masked_fill(block_mask_2 == 0, -1e4)
+        p_attn_1 = F.softmax(scores_1, dim=-1)  # [b, n_h, t_t, t_s]
+        p_attn_2 = F.softmax(scores_2, dim=-1)
+        lambda_ = (
+            torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
+            - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
+            + self.lambda_init
+        )
+        p_attn = p_attn_1 - lambda_ * p_attn_2
         p_attn = self.drop(p_attn)
         output = torch.matmul(p_attn, value)
         if self.window_size is not None:
