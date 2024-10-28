@@ -301,25 +301,33 @@ class MultiHeadAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # reshape [b, d, t] -> [b, n_h, t, d_k]
         b, d, t_s, t_t = (*key.size(), query.size(2))
-        query = query.view(b, self.n_heads, self.k_channels, t_t).transpose(2, 3)
-        key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
-        value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
 
         query_1, query_2 = torch.chunk(query, 2, dim=-1)
         key_1, key_2 = torch.chunk(key, 2, dim=-1)
+        _, _, t_s_1, t_t_1 = (*key_1.size(), query_1.size(2))
+        _, _, t_s_2, t_t_2 = (*key_2.size(), query_2.size(2))
 
-        scores_1 = torch.matmul(query_1 / math.sqrt(self.k_channels), key.transpose(-2, -1))
-        scores_2 = torch.matmul(query_2 / math.sqrt(self.k_channels), key.transpose(-2, -1))
+        query_1 = query_1.view(b, self.n_heads, self.k_channels, t_t_1).transpose(2, 3)
+        query_2 = query_2.view(b, self.n_heads, self.k_channels, t_t_2).transpose(2, 3)
+        key_1 = key_1.view(b, self.n_heads, self.k_channels, t_s_1).transpose(2, 3)
+        key_2 = key_2.view(b, self.n_heads, self.k_channels, t_s_2).transpose(2, 3)
+        value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
+
+        # scores_1 = torch.matmul(query_1 / math.sqrt(self.k_channels), key_1.transpose(-2, -1))
+        #scores_2 = torch.matmul(query_2 / math.sqrt(self.k_channels), key_2.transpose(-2, -1))
+        scores_1 = torch.matmul(query_1, key_1.transpose(-2, -1)) / math.sqrt(self.k_channels)
+        scores_2 = torch.matmul(query_2, key_2.transpose(-2, -1)) / math.sqrt(self.k_channels)
         if self.window_size is not None:
             assert (
                 t_s == t_t
             ), "Relative attention is only available for self-attention."
-            key_relative_embeddings = self._get_relative_embeddings(self.emb_rel_k, t_s)
+            key_relative_embeddings_1 = self._get_relative_embeddings(self.emb_rel_k, t_s_1)
+            key_relative_embeddings_2 = self._get_relative_embeddings(self.emb_rel_k, t_s_2)
             rel_logits_1 = self._matmul_with_relative_keys(
-                query_1 / math.sqrt(self.k_channels), key_relative_embeddings
+                query_1 / math.sqrt(self.k_channels), key_relative_embeddings_1
             )
             rel_logits_2 = self._matmul_with_relative_keys(
-                query_2 / math.sqrt(self.k_channels), key_relative_embeddings
+                query_2 / math.sqrt(self.k_channels), key_relative_embeddings_2
             )
             scores_local_1 = self._relative_position_to_absolute_position(rel_logits_1)
             scores_local_2 = self._relative_position_to_absolute_position(rel_logits_2)
